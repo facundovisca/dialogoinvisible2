@@ -5,15 +5,18 @@ const dronesGrave = [];
 let filtroDrones;
 
 // 🎹 SÍNTESIS CRISTALINA POLIFÓNICA (Sine + Triángulo desafinado)
-const MAX_VOCES_PULSO = 6;
+const MAX_VOCES_PULSO = 12;          // más voces: con tráfico real las colas largas ya no se pisan
+let ultimoPulso = 0;
+const INTERVALO_MIN_PULSO = 50;    // ms mínimos entre sonidos de probes (lo visual NO se limita)
 let oscsSine = [];
 let oscsTri = [];
 let envsPulso = [];
 let vozFiltro;
 let idxVozPulso = 0;
 
-// 🎼 MOTOR DE CONEXIONES Y ACORDES
-const MAX_VOCES_CONEXION = 4;
+// 🎼 MOTOR DE CONEXIONES Y ACORDES (cada célula del grupo aporta su propia nota)
+const MAX_VOCES_CONEXION = 12;        // 4 acordes de 3 notas en rotación
+let idxVozConexion = 0;
 let oscsConexionSine = [];
 let oscsConexionTri = [];
 let envsConexion = [];
@@ -42,7 +45,7 @@ const AMP_DRONE_MAX = [0.035, 0.025, 0.020];
 function asegurarReverb() {
   if (!reverb && typeof p5.Reverb !== "undefined") {
     reverb = new p5.Reverb();
-    reverb.set(6.0, 3.5); // Reverb generosa de cola larga
+    reverb.set(8.0, 4.5); // Una sola reverb compartida (cola larga). Antes cada process() la reconfiguraba y ganaba la última.
     reverb.drywet(0.55);
   }
 }
@@ -69,15 +72,12 @@ function iniciarCapaGrave() {
   }
 }
 
-function iniciarDrone() {}
-function iniciarCapa() {}
-
 function asegurarFiltroDrones() {
   if (!filtroDrones && typeof p5.LowPass !== "undefined") {
     filtroDrones = new p5.LowPass();
     filtroDrones.freq(520);
     filtroDrones.res(0.4);
-    if (reverb) reverb.process(filtroDrones, 7, 4);
+    if (reverb) reverb.process(filtroDrones);
   }
 }
 
@@ -115,10 +115,15 @@ function iniciarPulso() {
     envsPulso.push(env);
   }
 
-  if (reverb) reverb.process(vozFiltro, 7, 4);
+  if (reverb) reverb.process(vozFiltro);
 }
 
 function dispararPulsoCrecimiento(maduracion = 0, rssi = -70, frecuenciaNota = 146.83, nx = 0.5, entidadRef = null) {
+  // Lo visual va primero: el destello NO depende del volumen ni del interruptor de sonido.
+  if (entidadRef) {
+    entidadRef.brilloSonoro = 1.0;
+  }
+
   if (typeof params !== "undefined") {
     if (!params.pulsosEntidades) return;
     if (params.volProbes !== undefined && params.volProbes <= 0.001) return;
@@ -126,9 +131,10 @@ function dispararPulsoCrecimiento(maduracion = 0, rssi = -70, frecuenciaNota = 1
   if (frecuenciaNota === null || frecuenciaNota <= 0) return;
   if (oscsSine.length === 0 || !vozFiltro) return;
 
-  if (entidadRef) {
-    entidadRef.brilloSonoro = 1.0;
-  }
+  // Límite global de sonidos por segundo (evita el tartamudeo con mucho tráfico).
+  const ahoraPulso = millis();
+  if (ahoraPulso - ultimoPulso < INTERVALO_MIN_PULSO) return;
+  ultimoPulso = ahoraPulso;
 
   const sOsc = oscsSine[idxVozPulso];
   const tOsc = oscsTri[idxVozPulso];
@@ -169,9 +175,9 @@ function iniciarConexionSonora() {
     filtroConexion.disconnect();
     filtroConexion.connect(gainConexionesMaster);
     gainConexionesMaster.amp(1.0);
-    if (reverb) reverb.process(gainConexionesMaster, 8, 4.5);
+    if (reverb) reverb.process(gainConexionesMaster);
   } else {
-    if (reverb) reverb.process(filtroConexion, 8, 4.5);
+    if (reverb) reverb.process(filtroConexion);
   }
 
   oscsConexionSine = [];
@@ -198,48 +204,47 @@ function iniciarConexionSonora() {
   }
 }
 
-function dispararAcordeGrupo(vocesCluster, distPromedio, conexionRef = null) {
-  if (typeof params !== "undefined") {
-    if (!params.pulsosEntidades) return;
-    if (params.volConexiones !== undefined && params.volConexiones <= 0.001) return;
-  }
-  if (oscsConexionSine.length === 0 || !filtroConexion || !vocesCluster || vocesCluster.length < 2) return;
-
+// Devuelve true si el acorde "ocurrió" (pasó el límite de tiempo), suene o esté silenciado:
+// así los destellos visuales no dependen del volumen. Devuelve false si se descartó.
+function dispararAcordeGrupo(vocesCluster, distPromedio) {
+  if (!vocesCluster || vocesCluster.length < 2) return false;
   const vocesSonoras = vocesCluster.filter(v => v.freq !== null && v.freq > 0);
-  if (vocesSonoras.length === 0) return;
+  if (vocesSonoras.length === 0) return false;
 
   const ahora = millis();
-  if (ahora - ultimoDisparoAcorde < INTERVALO_MIN_ACORDE) return;
+  if (ahora - ultimoDisparoAcorde < INTERVALO_MIN_ACORDE) return false;
   ultimoDisparoAcorde = ahora;
 
-  // Tomamos las frecuencias base y armamos intervalos musicales (Octava arriba + Quinta justa/nota de color)
-  let baseFreq = vocesSonoras[0].freq;
-  let notasAcorde = [
-    baseFreq,
-    baseFreq * 1.5, // Quinta justa (puede generar notas de color consonantes)
-    baseFreq * 2.0  // Octava alta
-  ];
+  const p = (typeof params !== "undefined") ? params : {};
+  const silenciado = p.pulsosEntidades === false || (p.volConexiones !== undefined && p.volConexiones <= 0.001);
+  if (silenciado || oscsConexionSine.length === 0 || !filtroConexion) return true;
 
-  const numNotas = min(notasAcorde.length, MAX_VOCES_CONEXION);
-  const distRef = (typeof params !== "undefined" && params.distConexion) ? params.distConexion : 160;
+  // Cada célula del grupo canta su nota. Si faltan para llegar a 3, se completa con
+  // la octava y la octava + quinta de la primera (la nota "de color").
+  const notas = [...new Set(vocesSonoras.map(v => v.freq))].slice(0, 3);
+  const base = notas[0];
+  for (const extra of [base * 2, base * 3, base * 1.5]) {
+    if (notas.length >= 3) break;
+    if (!notas.some(n => Math.abs(n - extra) < 1)) notas.push(extra);
+  }
 
-  const gananciaConexiones = (typeof params !== "undefined" && params.volConexiones !== undefined) ? params.volConexiones : 1.0;
+  const numNotas = notas.length;
+  const distRef = p.distConexion ? p.distConexion : 160;
+  const gananciaConexiones = p.volConexiones !== undefined ? p.volConexiones : 1.0;
   const volBase = (map(distPromedio, 0, distRef, 0.12, 0.04, true) / Math.sqrt(numNotas)) * gananciaConexiones;
   const duracion = map(distPromedio, 0, distRef, 1.8, 3.8, true);
 
-  if (conexionRef) {
-    conexionRef.destellar();
-  }
-
   const delayPasoSegundos = 0.07;
+  const v0 = idxVozConexion;                                   // rotación: un acorde nuevo no corta la cola del anterior
+  idxVozConexion = (idxVozConexion + numNotas) % MAX_VOCES_CONEXION;
 
   for (let i = 0; i < numNotas; i++) {
-    const sOsc = oscsConexionSine[i];
-    const tOsc = oscsConexionTri[i];
-    const env = envsConexion[i];
-    const freq = notasAcorde[i];
-    const entidadVoz = vocesSonoras[i % vocesSonoras.length] ? vocesSonoras[i % vocesSonoras.length].entidad : null;
-    const nx = vocesSonoras[i % vocesSonoras.length] ? vocesSonoras[i % vocesSonoras.length].nx : 0.5;
+    const idx = (v0 + i) % MAX_VOCES_CONEXION;
+    const sOsc = oscsConexionSine[idx];
+    const tOsc = oscsConexionTri[idx];
+    const env = envsConexion[idx];
+    const freq = notas[i];
+    const nx = vocesSonoras[i % vocesSonoras.length].nx;
 
     const panIndividual = map(constrain(nx, 0.0, 1.0), 0.0, 1.0, -0.75, 0.75);
     if (typeof sOsc.pan === "function") {
@@ -259,57 +264,60 @@ function dispararAcordeGrupo(vocesCluster, distPromedio, conexionRef = null) {
     const retardoVoz = i * delayPasoSegundos;
     env.play(sOsc, retardoVoz);
     env.play(tOsc, retardoVoz);
-
-    if (entidadVoz) {
-      if (retardoVoz === 0) {
-        entidadVoz.brilloSonoro = 1.0;
-      } else {
-        setTimeout(() => {
-          if (entidadVoz) entidadVoz.brilloSonoro = 1.0;
-        }, retardoVoz * 1000);
-      }
-    }
   }
-}
-
-function dispararSonidoMitosis(f1, f2, nx = 0.5) {
-  if (typeof params !== "undefined") {
-    if (!params.pulsosEntidades) return;
-    if (params.volConexiones !== undefined && params.volConexiones <= 0.001) return;
-  }
-  if ((f1 === null || f1 <= 0) && (f2 === null || f2 <= 0)) return;
-  if (oscsConexionSine.length < 2 || !filtroConexion) return;
-
-  let raiz = f1 !== null && f1 > 0 ? f1 : (f2 !== null && f2 > 0 ? f2 : 146.83);
-  const ganancia = (typeof params !== "undefined" && params.volConexiones !== undefined) ? params.volConexiones : 1.0;
-  const notas = [raiz, raiz * 1.5, raiz * 2.0];
-  const panBase = map(constrain(nx, 0.0, 1.0), 0.0, 1.0, -0.8, 0.8);
-
-  for (let i = 0; i < 3; i++) {
-    const sOsc = oscsConexionSine[i % oscsConexionSine.length];
-    const tOsc = oscsConexionTri[i % oscsConexionTri.length];
-    const env = envsConexion[i % envsConexion.length];
-
-    const panVoz = constrain(panBase + (i === 1 ? -0.2 : i === 2 ? 0.2 : 0), -0.8, 0.8);
-    if (typeof sOsc.pan === "function") {
-      sOsc.pan(panVoz, 0.01);
-      tOsc.pan(panVoz, 0.01);
-    }
-
-    sOsc.freq(notas[i], 0.01);
-    tOsc.freq(notas[i] * 1.003, 0.01);
-
-    env.setADSR(0.05 + i * 0.04, 0.2, 0.0, 0.9 + i * 0.2);
-    env.setRange(0.12 * ganancia, 0);
-
-    env.play(sOsc, i * 0.06);
-    env.play(tOsc, i * 0.06);
-  }
+  return true;
 }
 
 // ---------------- 4. ACTUALIZACIÓN DINÁMICA DEL DRONE CON TRÁFICO ----------------
 
-function actualizarCampo(densidad, maduracionPromedio = 0.5) {
+// Compresor suave en la salida. p5.sound ya trae un limitador duro al final (-3 dB, ratio 20):
+// este compresor actúa ANTES, con ajustes suaves, para que los momentos densos se "aplanen"
+// con naturalidad y no lleguen a tocar el limitador (que sí se oiría como distorsión).
+const COMPRESOR_MAESTRO = true;
+function iniciarMasterSuave() {
+  if (!COMPRESOR_MAESTRO) return;
+  try {
+    const so = p5.soundOut;
+    const ctx = getAudioContext();
+    if (!so || !so.input || !so.limiter) {
+      console.warn("Compresor maestro: no se encontró la cadena interna de p5.sound; se omite.");
+      return;
+    }
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -16;
+    comp.knee.value = 20;
+    comp.ratio.value = 2.5;
+    comp.attack.value = 0.03;
+    comp.release.value = 0.4;
+    so.input.disconnect();
+    so.input.connect(comp);
+    comp.connect(so.limiter);
+  } catch (e) {
+    console.warn("Compresor maestro no instalado:", e);
+  }
+}
+
+// Reinicio de la obra: límites de tiempo y rotación de voces vuelven a cero.
+// (Las notas que ya estaban sonando terminan solas con su cola natural.)
+function reiniciarSonido() {
+  ultimoDisparoAcorde = 0;
+  ultimoPulso = 0;
+  idxVozPulso = 0;
+  idxVozConexion = 0;
+}
+
+// Estado previo del interruptor de sonido (null = todavía no se aplicó).
+let sonidoHabilitadoPrevio = null;
+
+function actualizarCampo(densidad) {
+  // Interruptor "Habilitar Sonido": silencia TODO (drones, probes, acordes y colas en vuelo)
+  // con un fade corto de 0,25 s. Solo se aplica cuando el estado cambia.
+  const habilitado = !(typeof params !== "undefined" && params.pulsosEntidades === false);
+  if (habilitado !== sonidoHabilitadoPrevio && typeof outputVolume === "function") {
+    sonidoHabilitadoPrevio = habilitado;
+    outputVolume(habilitado ? 1 : 0, 0.25);
+  }
+
   const vGrave = (typeof params !== "undefined" && params.volGrave !== undefined) ? params.volGrave : 0.7;
   const vDrone = (typeof params !== "undefined" && params.volDrone !== undefined) ? params.volDrone : 0.7;
 
@@ -327,7 +335,7 @@ function actualizarCampo(densidad, maduracionPromedio = 0.5) {
 
   for (let i = 0; i < dronesGrave.length; i++) {
     const d = dronesGrave[i];
-    const marea = map(sin(frameCount * 0.0004 + d.seed), -1, 1, 0.6, 1.0);
+    const marea = map(sin(millis() * 0.000024 + d.seed), -1, 1, 0.6, 1.0);
     const ampFinal = d.maxAmp * factorDucking * marea * ((i === 0) ? vGrave : vDrone);
     d.osc.amp(ampFinal, 0.2);
   }

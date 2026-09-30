@@ -1,3 +1,10 @@
+// Hash simple y estable de un texto (para que cada MAC tenga siempre la misma nota).
+function hashTexto(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) h = Math.imul(h ^ str.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+
 class Entidad {
   constructor(x, y, rssi = -70, mac = "", esEspora = false, anguloInicial = null) {
     this.mac = mac;
@@ -12,8 +19,7 @@ class Entidad {
     this.tamBase = esEspora ? random(10, 15) : random(16, 24);
     this.brilloSonoro = 0.0; 
     
-    this.opacidadBase = 0.35; 
-    this.opacidad = 1.0;
+    this.opacidad = 0.0;          // nace transparente y aparece de a poco
     // Madurez 0..1: 0 = recién nacido, 1 = tamaño máximo (se reproduce).
     // Sube con cada probe (o con cada conexión, en las esporas) y baja muy despacio.
     this.madurez = 0.0;
@@ -22,7 +28,6 @@ class Entidad {
     this.reproducciones = 0;      // cuántas veces se reprodujo (las esporas tienen un máximo)
     this.llegoAlMax = false;      // se activa al llegar a madurez 1 (no se pierde por el decaimiento)
     this.tUlt = millis();
-    this.energia = 1.0;
     this.muerta = false;
 
     // Ciclo de vida: la entidad vive mientras siga recibiendo probes.
@@ -32,7 +37,10 @@ class Entidad {
     this.velDesvanecer = 0.008;   // opacidad perdida por frame al desvanecerse
 
     if (typeof ESCALA_BASE_CONSONANTE !== "undefined" && ESCALA_BASE_CONSONANTE.length > 0) {
-      this.frecuencia = random(ESCALA_BASE_CONSONANTE);
+      // Cada dispositivo canta siempre la misma nota (derivada de su MAC). Sin MAC: al azar.
+      this.frecuencia = mac
+        ? ESCALA_BASE_CONSONANTE[hashTexto(mac) % ESCALA_BASE_CONSONANTE.length]
+        : random(ESCALA_BASE_CONSONANTE);
     } else {
       this.frecuencia = 146.83;
     }
@@ -106,47 +114,54 @@ class Entidad {
   }
 
   actualizar(ahora) {
+    // Tiempo real transcurrido. k = "cuadros equivalentes" (1 a 60 fps): todo lo que antes
+    // era por-cuadro se multiplica por k, así la velocidad no depende del framerate.
+    const dt = min(0.1, (ahora - this.tUlt) / 1000);
+    this.tUlt = ahora;
+    const k = dt * 60;
+
     // --- Ciclo de vida ---
     const vidaMs = (params.vidaEntidad !== undefined ? params.vidaEntidad : 60) * 1000;
     if (!this.desvaneciendo && ahora - this.ultimoProbe > vidaMs) {
       this.desvaneciendo = true;
     }
     if (this.desvaneciendo) {
-      this.opacidad = max(0, this.opacidad - this.velDesvanecer);
+      this.opacidad = max(0, this.opacidad - this.velDesvanecer * k);
       if (this.opacidad <= 0.02) this.muerta = true;
     } else {
-      // Reaparición suave si estaba a medio desvanecer y llegó un probe.
-      this.opacidad = min(1.0, this.opacidad + 0.05);
+      // Aparición suave al nacer (y reaparición si estaba a medio desvanecer).
+      this.opacidad = min(1.0, this.opacidad + 0.04 * k);
     }
 
-    this.brilloSonoro *= 0.86;
+    this.brilloSonoro *= Math.pow(0.86, k);
 
-    // Decaimiento lento de la madurez, en tiempo real (no depende del framerate).
-    const dt = min(0.1, (ahora - this.tUlt) / 1000);
-    this.tUlt = ahora;
+    // Decaimiento lento de la madurez, en tiempo real.
     const decae = (params.decaimientoMadurez !== undefined ? params.decaimientoMadurez : 0.004);
     this.madurez = max(0, this.madurez - decae * dt);
 
-    // La madurez que se dibuja persigue a la real con una transición suave (~1 s),
-    // así cada probe hace crecer a la entidad de a poco en vez de dar un salto.
+    // La madurez que se dibuja persigue a la real con una transición suave (~1 s).
     this.madurezVisual += (this.madurez - this.madurezVisual) * (1 - Math.exp(-dt * 3));
 
     // Al madurar se vuelven más lentas.
     this.velBase = lerp(this.rangoVelRapida, this.rangoVelLenta, this.maduracion);
-    
-    this.tiempoRuido += 0.004 * params.velGlobal;
-    const variacionAngular = map(noise(this.tiempoRuido + this.seed), 0, 1, -0.06, 0.06);
-    this.angulo += variacionAngular;
 
+    this.tiempoRuido += 0.004 * params.velGlobal * k;
+    const variacionAngular = map(noise(this.tiempoRuido + this.seed), 0, 1, -0.06, 0.06);
+    this.angulo += variacionAngular * k;
+
+    // Zona de vida elíptica (aprovecha todo el ancho de la pantalla, no un círculo de radio height*0.4).
     const centroX = width * 0.5;
     const centroY = height * 0.5;
-    
-    if (dist(this.x, this.y, centroX, centroY) > height * 0.4) {
+    const ex = (this.x - centroX) / (width * 0.45);
+    const ey = (this.y - centroY) / (height * 0.42);
+    if (ex * ex + ey * ey > 1) {
       const anguloAlCentro = atan2(centroY - this.y, centroX - this.x);
-      this.angulo = lerp(this.angulo, anguloAlCentro, 0.02);
+      // Giro por el camino más corto (antes el lerp podía dar la vuelta larga y hacerla girar en círculos).
+      const dif = atan2(sin(anguloAlCentro - this.angulo), cos(anguloAlCentro - this.angulo));
+      this.angulo += dif * (1 - Math.pow(1 - 0.02, k));
     }
 
-    const velocidadActual = this.velBase * params.velGlobal;
+    const velocidadActual = this.velBase * params.velGlobal * k;
     this.x += cos(this.angulo) * velocidadActual;
     this.y += sin(this.angulo) * velocidadActual;
 

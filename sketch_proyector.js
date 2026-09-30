@@ -1,7 +1,15 @@
 const canal = new BroadcastChannel('instalacion_dialogo');
 
+// Latido: si el notebook deja de enviar cuadros, la imagen se funde a negro en vez de quedar congelada.
+let ultimoFrame = 0;
+const SIN_SENAL_MS = 2000;
+
 let entidadesRecibidas = [];
 let conexionesRecibidas = [];
+
+// Resolución del notebook que genera los datos (llega en cada SYNC_FRAME).
+let anchoOrigen = 1440;
+let altoOrigen = 900;
 
 const params = {
   distConexion: 160,
@@ -17,8 +25,11 @@ function setup() {
     const data = event.data;
 
     if (data.tipo === 'SYNC_FRAME') {
+      ultimoFrame = performance.now();
       entidadesRecibidas = data.entidades || [];
       conexionesRecibidas = data.conexiones || [];
+      if (data.anchoOrigen) anchoOrigen = data.anchoOrigen;
+      if (data.altoOrigen) altoOrigen = data.altoOrigen;
       if (data.params) {
         Object.assign(params, data.params);
       }
@@ -30,61 +41,28 @@ function setup() {
 }
 
 function draw() {
-  background(0,45);
+  background(0, 45);
 
-  // 1. Dibujar conexiones sincronizadas
-  for (const c of conexionesRecibidas) {
-    const ax = c.nax * width;
-    const ay = c.nay * height;
-    const bx = c.nbx * width;
-    const by = c.nby * height;
-
-    const d = dist(ax, ay, bx, by);
-    const alphaBase = map(d, 0, params.distConexion, 180, 20);
-    const alphaFinal = constrain(
-      (alphaBase * c.vida * params.opacidadLineas) + ((c.brilloFlash || 0) * 255),
-      0,
-      255
-    );
-
-    const grosor = map(c.brilloFlash || 0, 0, 1, 0.9, 3.2);
-
-    stroke(255, constrain(alphaFinal, 0, 255));
-    strokeWeight(grosor);
-    noFill();
-
-    beginShape();
-    const pasos = 10;
-    for (let i = 0; i <= pasos; i++) {
-      const t = i / pasos;
-      let x = lerp(ax, bx, t);
-      let y = lerp(ay, by, t);
-
-      const n = noise(x * 0.01, y * 0.01, frameCount * 0.01 + c.seed);
-      const offset = map(n, 0, 1, -10, 10);
-
-      const angle = atan2(by - ay, bx - ax);
-      const perp = angle + HALF_PI;
-
-      x += cos(perp) * offset * sin(t * PI);
-      y += sin(perp) * offset * sin(t * PI);
-
-      curveVertex(x, y);
-    }
-    endShape();
+  if (ultimoFrame > 0 && performance.now() - ultimoFrame > SIN_SENAL_MS &&
+      (entidadesRecibidas.length > 0 || conexionesRecibidas.length > 0)) {
+    entidadesRecibidas = [];      // el fondo translúcido se encarga del fundido a negro
+    conexionesRecibidas = [];
   }
 
-  // 2. Dibujar entidades sincronizadas (Estética de núcleos y halos)
+  // Factor de escala proyector / notebook: tamaños y grosores se ven igual en cualquier resolución.
+  const k = (width / anchoOrigen + height / altoOrigen) / 2;
+
+  // 1. Entidades (mismo orden de dibujo que el notebook: primero células, después filamentos)
   noStroke();
   for (const e of entidadesRecibidas) {
     const px = e.nx * width;
     const py = e.ny * height;
     const escala = e.escala !== undefined ? e.escala : 1.0;
-    const tamEscalado = e.tamBase * params.tamanoBase * e.factorCercania * escala;
+    const tamEscalado = e.tamBase * params.tamanoBase * e.factorCercania * escala * k;
     const brilloSonoro = e.brilloSonoro || 0;
 
     const maduracion = constrain(e.madurez || 0, 0, 1);
-    
+
     const r = lerp(70, 50, maduracion);
     const g = lerp(235, 130, maduracion);
     const b = lerp(150, 255, maduracion);
@@ -96,7 +74,7 @@ function draw() {
     }
 
     const alphaNucleo = map(brilloSonoro, 0, 1, 90, 255) * min(1.0, e.opacidad) * params.brilloParticulas;
-    const tamNucleo = max(1.5, tamEscalado * map(brilloSonoro, 0, 1, 0.6, 2.0));
+    const tamNucleo = max(1.5 * k, tamEscalado * map(brilloSonoro, 0, 1, 0.6, 2.0));
 
     if (brilloSonoro > 0.05) {
       fill(255, 255, 255, brilloSonoro * 150 * params.brilloParticulas);
@@ -105,6 +83,22 @@ function draw() {
 
     fill(255, constrain(alphaNucleo, 0, 255));
     ellipse(px, py, tamNucleo);
+  }
+
+  // 2. Conexiones: misma función de dibujo y de opacidad que el notebook (Conexion.js)
+  for (const c of conexionesRecibidas) {
+    const ax = c.nax * width;
+    const ay = c.nay * height;
+    const bx = c.nbx * width;
+    const by = c.nby * height;
+
+    // Distancia en píxeles del NOTEBOOK (la escala en que está definida distConexion), en vivo.
+    const d = dist(c.nax * anchoOrigen, c.nay * altoOrigen, c.nbx * anchoOrigen, c.nby * altoOrigen);
+    const flash = c.brilloFlash || 0;
+
+    stroke(255, Conexion.alpha(d, params.distConexion, c.vida, params.opacidadLineas, flash));
+    strokeWeight(Conexion.grosor(flash) * k);
+    Conexion.trazar(ax, ay, bx, by, c.seed, k);
   }
 }
 

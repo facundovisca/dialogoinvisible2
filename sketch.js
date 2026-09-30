@@ -1,5 +1,5 @@
 const canalProyector = new BroadcastChannel("instalacion_dialogo");
-let ventanaProyector = null;
+let ultimoTick = 0;   // para escalar la lógica por tiempo real (no por cuadro)
 
 let MOCK_MODE = true;
 let ultimoMockAuto = 0;
@@ -27,6 +27,7 @@ const params = {
   madurezTrasReproducir: 0.0,    // madurez de la madre después de reproducirse (0 = vuelve a empezar)
   vidaEntidad: 60,       // segundos sin probe antes de que la entidad se desvanezca
   maxEntidades: 200,     // tope duro: si se supera, se desvanecen las más viejas
+  maxConexiones: 250,    // tope de conexiones vivas a la vez (evita miles de líneas y mensajes al proyector)
   intervaloMock: 900,
   volDrone: 0.7,
   volGrave: 0.7,
@@ -54,15 +55,70 @@ let hudVisible = true;
 let guiDiv;
 let port;
 
-const influencias = [];
 const LOG_MAX = 15;
 let serialLogEl;
 
-function limpiarTodasLasEntidades() {
+// --- Serial robusto: reconexión automática + aviso de silencio ---
+let serialEstado = "sim";            // "sim" | "conectado" | "sin datos" | "desconectado" | "pausado"
+let ultimoDatoSerial = 0;
+let ultimoIntentoSerial = 0;
+let serialPausadoManual = false;     // true si se cerró a mano con [C]: no reconectar
+const SERIAL_REINTENTO_MS = 5000;
+const SERIAL_SILENCIO_MS = 120000;   // 2 min sin ningún dato = aviso
+
+// --- Una sola conexión viva por par de células (se renueva en vez de duplicarse) ---
+const conexionesPorPar = new Map();
+const DENSIDAD_REF = 25;             // conexiones simultáneas que equivalen a "densidad máxima" (mueve drones y filtro)
+
+// --- Envío al proyector ---
+let ultimoSync = 0;
+
+// --- Grabación de probes a CSV (tecla [G]) para calibrar con datos reales ---
+const CSV_MAX_FILAS = 200000;
+let grabandoCSV = false;
+let filasCSV = [];
+let inicioGrabacion = 0;
+const macsVistas = new Set();
+const macsAleatorias = new Set();
+let ultimoLog = 0;
+
+// Temporizadores pendientes de la obra (arpegios, destellos): se cancelan al reiniciar.
+const timeoutsObra = new Set();
+function programar(fn, ms) {
+  const id = setTimeout(() => { timeoutsObra.delete(id); fn(); }, ms);
+  timeoutsObra.add(id);
+}
+
+// REINICIAR OBRA: vuelve todo a cero, como si recién se encendiera la instalación.
+function reiniciarObra() {
+  // Células, conexiones y memoria de dispositivos (cooldown por MAC)
   mapEntidades.clear();
   conexiones.length = 0;
   ultimosProbesPorMac.clear();
-  influencias.length = 0;
+  contadorEsporas = 0;
+  conexionesPorPar.clear();
+  ultimoDatoSerial = 0;
+
+  // Probe requests: descartar lo que quedó en cola en el puerto serial...
+  if (port && typeof port.availableBytes === "function") {
+    try {
+      let guardia = 0;
+      while (port.availableBytes() > 0 && guardia++ < 5000) {
+        if (!port.readUntil("\n")) break;
+      }
+    } catch (e) { /* puerto cerrado: no hay nada que descartar */ }
+  }
+  // ...reiniciar el simulador (espera un intervalo completo antes del primer probe)...
+  ultimoMockAuto = millis();
+  // ...y vaciar el registro de probes que se ve en pantalla.
+  if (serialLogEl) serialLogEl.innerHTML = "";
+
+  // Arpegios y destellos que estaban por ocurrir
+  timeoutsObra.forEach(clearTimeout);
+  timeoutsObra.clear();
+
+  // Sonido: límites de tiempo y rotación de voces de vuelta a cero
+  if (typeof reiniciarSonido === "function") reiniciarSonido();
 
   canalProyector.postMessage({ tipo: "LIMPIAR_TODO" });
 }
@@ -75,19 +131,6 @@ function setup() {
     const data = event.data;
     if (data.tipo === "COMANDO_TECLA") {
       ejecutarComandoTeclado(data.tecla);
-    } else if (data.tipo === "PEDIR_ESTADO") {
-      for (const [mac, e] of mapEntidades.entries()) {
-        canalProyector.postMessage({
-          tipo: "NUEVA_ENTIDAD",
-          mac: mac,
-          x: e.x,
-          y: e.y,
-          rssi: e.rssi,
-          anchoOrigen: width,
-          altoOrigen: height,
-          params: params,
-        });
-      }
     }
   };
 
@@ -164,7 +207,7 @@ function setup() {
   sVolGrave = crearControl("Vol. Drones Grav", 0, 3, params.volGrave, 0.1);
 
   createDiv("<br><b>PARTÍCULAS Y EVENTOS</b>").parent(guiDiv);
-  sVolProbes = crearControl("Vol. Probes FM", 0, 3, params.volProbes, 0.1);
+  sVolProbes = crearControl("Vol. Probes", 0, 3, params.volProbes, 0.1);
   sVolConexiones = crearControl("Vol. Conexiones", 0, 3, params.volConexiones, 0.1);
 
   cbPulsosEntidades = createCheckbox(" Habilitar Sonido", params.pulsosEntidades);
@@ -172,7 +215,7 @@ function setup() {
   cbPulsosEntidades.style("margin-top", "3px");
 
   createDiv("<br><b>ACCIONES</b>").parent(guiDiv);
-  btnLimpiar = createButton("LIMPIAR CÉLULAS [R]");
+  btnLimpiar = createButton("REINICIAR OBRA [R]");
   btnLimpiar.parent(guiDiv);
   btnLimpiar.style("background", "#111");
   btnLimpiar.style("color", "#fff");
@@ -182,7 +225,7 @@ function setup() {
   btnLimpiar.style("font-size", "11px");
   btnLimpiar.style("cursor", "pointer");
   btnLimpiar.style("margin-top", "2px");
-  btnLimpiar.mousePressed(limpiarTodasLasEntidades);
+  btnLimpiar.mousePressed(reiniciarObra);
 
   if (!MOCK_MODE) {
     port = createSerial();
@@ -190,15 +233,14 @@ function setup() {
     if (usedPorts.length > 0) port.open(usedPorts[0], 115200);
   }
 
-  iniciarDrone();
-  iniciarCapa();
   iniciarCapaGrave();
   iniciarPulso();
   iniciarConexionSonora();
+  if (typeof iniciarMasterSuave === "function") iniciarMasterSuave();
 
   setInterval(() => {
     if (document.hidden) actualizarLogicaGlobal();
-  }, 1000 / 45);
+  }, 1000 / 60);
 }
 
 function draw() {
@@ -241,10 +283,10 @@ function draw() {
     textAlign(LEFT, TOP);
     noStroke();
     fill(0, 0, 0, 220);
-    rect(20, 20, 520, 26, 3);
+    rect(20, 20, 600, 26, 3);
     stroke(255, 60);
     noFill();
-    rect(20, 20, 520, 26, 3);
+    rect(20, 20, 600, 26, 3);
 
     noStroke();
     fill(180);
@@ -270,6 +312,24 @@ function draw() {
     const yFooter = height - margenInf;
     const altoFooter = 24;
 
+    // Línea de estado justo arriba del pie: serial y grabación
+    textSize(11);
+    textAlign(LEFT, CENTER);
+    noStroke();
+    const yEstado = yFooter - 14;
+    let xEstado = 24;
+    const est = textoEstadoSerial();
+    if (est) {
+      fill(...est.col);
+      text(est.txt, xEstado, yEstado);
+      xEstado += textWidth(est.txt) + 24;
+    }
+    if (grabandoCSV) {
+      fill(255, 80, 80);
+      const pctAleat = macsVistas.size ? round(100 * macsAleatorias.size / macsVistas.size) : 0;
+      text(`● REC ${filasCSV.length - 1} probes · MACs únicas ${macsVistas.size} · aleatorias ${macsAleatorias.size} (${pctAleat}%) · [G] para guardar`, xEstado, yEstado);
+    }
+
     noStroke();
     fill(0, 0, 0, 210);
     rect(20, yFooter, width - 40, altoFooter, 3);
@@ -289,7 +349,8 @@ function draw() {
       { tecla: "[M]", desc: "Modo Real/Sim" },
       { tecla: "[N]", desc: "Disparar Probe" },
       { tecla: "[P]", desc: "Abrir Proyector" },
-      { tecla: "[R]", desc: "Limpiar Células" },
+      { tecla: "[R]", desc: "Reiniciar Obra" },
+      { tecla: "[G]", desc: "Grabar Probes" },
       { tecla: "[F]", desc: "Pantalla Completa" },
       { tecla: "[H]", desc: "Ocultar Controles" }
     ];
@@ -306,12 +367,31 @@ function draw() {
     }
     pop();
   }
+  else {
+    // HUD oculto: solo se muestra algo si hay un problema (o se está grabando), bien discreto.
+    const est = textoEstadoSerial();
+    const hayProblema = est && serialEstado !== "conectado" && serialEstado !== "sim";
+    if (hayProblema || grabandoCSV) {
+      push();
+      textFont("monospace");
+      textSize(11);
+      textAlign(LEFT, TOP);
+      noStroke();
+      if (hayProblema) { fill(...est.col, 160); text(est.txt, 14, 12); }
+      if (grabandoCSV) { fill(255, 80, 80, 160); text("● REC", 14, hayProblema ? 28 : 12); }
+      pop();
+    }
+  }
 }
 
 function actualizarLogicaGlobal() {
   const ahora = millis();
+  // kt = cuadros equivalentes desde la última llamada (1 a 60 fps). Todo lo "por cuadro" se escala con kt.
+  const kt = ultimoTick === 0 ? 1 : constrain((ahora - ultimoTick) / (1000 / 60), 0, 6);
+  ultimoTick = ahora;
 
   // Contador de entrada: cuántos probes llegan y cuántos se aceptan por segundo.
+  if (ultimoConteoEntrada === 0) ultimoConteoEntrada = ahora;
   const transcurrido = ahora - ultimoConteoEntrada;
   if (transcurrido >= 1000) {
     const seg = transcurrido / 1000;
@@ -326,7 +406,8 @@ function actualizarLogicaGlobal() {
   }
 
   if (!MOCK_MODE) {
-    if (port) {
+    gestionarSerial(ahora);
+    if (port && serialEstado !== "desconectado" && serialEstado !== "pausado") {
       // Antes: una línea por frame. Con probes reales el buffer crecía y aparecía latencia.
       let leidas = 0;
       while (port.availableBytes() > 0 && leidas < MAX_LINEAS_SERIAL_POR_FRAME) {
@@ -335,6 +416,7 @@ function actualizarLogicaGlobal() {
         procesarMensajeSerial(str.trim());
         leidas++;
       }
+      if (leidas > 0) ultimoDatoSerial = ahora;
     }
   } else {
     if (ahora - ultimoMockAuto > params.intervaloMock) {
@@ -343,11 +425,9 @@ function actualizarLogicaGlobal() {
     }
   }
 
-  let sumaMaduracion = 0;
   const paraReproducir = [];
   for (const [mac, e] of mapEntidades.entries()) {
     e.actualizar(ahora);
-    sumaMaduracion += e.maduracion;
     if (e.muerta) {
       mapEntidades.delete(mac);
       ultimosProbesPorMac.delete(mac);
@@ -360,23 +440,32 @@ function actualizarLogicaGlobal() {
 
   // Tope duro: si hay demasiadas, se desvanecen las de probe más viejo.
   // Se cuentan solo las que no están ya yéndose, para no marcar de más mientras se desvanecen.
-  if (mapEntidades.size > params.maxEntidades) {
-    const vivas = Array.from(mapEntidades.values())
-      .filter(e => !e.forzadaAMorir)
-      .sort((x, y) => x.ultimoProbe - y.ultimoProbe);
+  const vivas = Array.from(mapEntidades.values()).filter(e => !e.desvaneciendo);
+  if (vivas.length > params.maxEntidades) {
+    // Primero se van las esporas (de mayor generación, y las más viejas). Los dispositivos reales, al final:
+    // las esporas renuevan su "último probe" con cada conexión y antes hacían que se sacrificara al dispositivo real.
+    vivas.sort((x, y) =>
+      (Number(y.esEspora) - Number(x.esEspora)) ||
+      (y.generacion - x.generacion) ||
+      (x.ultimoProbe - y.ultimoProbe));
     const sobrantes = vivas.length - params.maxEntidades;
     for (let i = 0; i < sobrantes; i++) vivas[i].morir();
   }
 
   const entidadesActivas = Array.from(mapEntidades.values());
-  const maduracionPromedio = entidadesActivas.length > 0 ? sumaMaduracion / entidadesActivas.length : 0.5;
 
   for (let i = conexiones.length - 1; i >= 0; i--) {
-    conexiones[i].actualizar();   // decae el flash siempre, se dibuje o no en el notebook
-    conexiones[i].vida -= 0.015;
-    if (conexiones[i].vida <= 0.02) conexiones.splice(i, 1);
+    conexiones[i].actualizar(kt);   // decae el flash siempre, se dibuje o no en el notebook
+    conexiones[i].vida -= 0.015 * kt;
+    if (conexiones[i].vida <= 0.02) {
+      const c = conexiones[i];
+      if (conexionesPorPar.get(c.clave) === c) conexionesPorPar.delete(c.clave);
+      conexiones.splice(i, 1);
+    }
   }
 
+  // La probabilidad es "por cuadro a 60 fps": se ajusta al tiempo real transcurrido.
+  const pCon = 1 - Math.pow(1 - params.probConexion, kt);
   let acordeDisparadoEsteFrame = false;
 
   for (let i = 0; i < entidadesActivas.length; i++) {
@@ -386,9 +475,25 @@ function actualizarLogicaGlobal() {
       if (a.opacidad < 0.3 || b.opacidad < 0.3) continue;
       const d = dist(a.x, a.y, b.x, b.y);
 
-      if (d < params.distConexion && random() < params.probConexion) {
-        const nuevaConexion = new Conexion(a, b, d);
-        conexiones.push(nuevaConexion);
+      if (d < params.distConexion && random() < pCon) {
+        // Un par de células tiene UNA sola conexión viva: si ya existe se renueva y destella de nuevo
+        // (antes se apilaban varias líneas encima y se inflaba la "densidad").
+        const clave = a.mac < b.mac ? a.mac + "|" + b.mac : b.mac + "|" + a.mac;
+        let existente = conexionesPorPar.get(clave);
+        if (existente && !((existente.a === a && existente.b === b) || (existente.a === b && existente.b === a))) {
+          existente = null;   // quedó de una célula anterior con la misma MAC: se reemplaza por una nueva
+        }
+        if (existente) {
+          existente.vida = 1.0;
+          existente.destellar();     // el destello de la línea no depende del sonido
+        } else {
+          if (conexiones.length >= params.maxConexiones) continue;
+          const nuevaConexion = new Conexion(a, b, d);
+          nuevaConexion.clave = clave;
+          nuevaConexion.destellar();
+          conexiones.push(nuevaConexion);
+          conexionesPorPar.set(clave, nuevaConexion);
+        }
 
         if (typeof a.alimentar === "function") a.alimentar();
         if (typeof b.alimentar === "function") b.alimentar();
@@ -418,12 +523,17 @@ function actualizarLogicaGlobal() {
           }
 
           if (typeof dispararAcordeGrupo === "function") {
-            dispararAcordeGrupo(clusterVoces, sumaDist / cantNodos, nuevaConexion);
+            const ocurrio = dispararAcordeGrupo(clusterVoces, sumaDist / cantNodos);
             acordeDisparadoEsteFrame = true;
+            if (ocurrio) {
+              // Destellos independientes del volumen: cada célula se ilumina en su turno del arpegio.
+              clusterVoces.forEach((v, idx) => {
+                if (idx === 0) v.entidad.brilloSonoro = 1.0;
+                else programar(() => { v.entidad.brilloSonoro = 1.0; }, idx * 70);
+              });
+            }
           }
         }
-
-        influencias.push({ fuerza: map(d, 0, params.distConexion, 0.6, 0.2), vida: 1.0 });
       }
     }
   }
@@ -438,7 +548,6 @@ function actualizarLogicaGlobal() {
       madurez: e.madurezVisual,
       escala: e.escalaTamano,
       opacidad: e.opacidad,
-      energia: e.energia,
       brilloSonoro: e.brilloSonoro,
       tamBase: e.tamBase
     });
@@ -458,8 +567,14 @@ function actualizarLogicaGlobal() {
     });
   }
 
-  canalProyector.postMessage({
+  // Con poca carga se envía a 60 Hz. Con muchísimos elementos se baja a ~30 Hz para no saturar el canal.
+  const pesado = payloadEntidades.length + payloadConexiones.length > 300;
+  const enviar = !pesado || ahora - ultimoSync >= 33;
+  if (enviar) ultimoSync = ahora;
+  if (enviar) canalProyector.postMessage({
     tipo: "SYNC_FRAME",
+    anchoOrigen: width,     // el proyector escala tamaños y distancias según esta resolución
+    altoOrigen: height,
     entidades: payloadEntidades,
     conexiones: payloadConexiones,
     params: {
@@ -470,13 +585,8 @@ function actualizarLogicaGlobal() {
     }
   });
 
-  for (let i = influencias.length - 1; i >= 0; i--) {
-    influencias[i].vida *= 0.96;
-    if (influencias[i].vida < 0.03) influencias.splice(i, 1);
-  }
-
-  let densidad = constrain(conexiones.length / 60, 0, 1);
-  actualizarCampo(densidad, maduracionPromedio);
+  let densidad = constrain(conexiones.length / DENSIDAD_REF, 0, 1);
+  actualizarCampo(densidad);
 }
 
 let contadorEsporas = 0;
@@ -515,14 +625,13 @@ function reproducirCelula(madre) {
     hija.generacion = madre.generacion + 1;
     hija.frecuencia = notas[i];
     hija.brilloSonoro = 1.0;
-    hija.energia = 1.0;
     mapEntidades.set(id, hija);
 
     // Cada hija suena con su nota propia, escalonadas como un pequeño arpegio.
     if (typeof dispararPulsoCrecimiento === "function") {
       const sonar = () => dispararPulsoCrecimiento(0.5, hija.rssi, hija.frecuencia, hija.x / width, hija);
       if (i === 0) sonar();
-      else setTimeout(sonar, i * 110);
+      else programar(sonar, i * 110);
     }
   }
 
@@ -532,7 +641,6 @@ function reproducirCelula(madre) {
   madre.reproducciones++;
   madre.brilloSonoro = 1.0;
 
-  influencias.push({ fuerza: 1.0, vida: 1.5 });
 }
 
 function procesarMensajeSerial(str) {
@@ -541,22 +649,23 @@ function procesarMensajeSerial(str) {
     const mac = partes[1].trim();
     const rssi = parseInt(partes[2].trim(), 10);
     if (!mac || isNaN(rssi)) return;   // línea corrupta: antes NaN pasaba el filtro de RSSI
-    const ssid = partes.length >= 4 ? partes[3].trim() : "";
+    const ssid = partes.length >= 4 ? partes.slice(3).join(",").trim() : "";   // un SSID puede traer comas
 
     probesRecibidos++;
 
-    if (rssi < params.rssiMinimo) return;
+    if (rssi < params.rssiMinimo) { registrarProbeCSV(mac, rssi, ssid, "descartado_rssi"); return; }
 
     // Reducción de entrada: acepta solo el porcentaje elegido de los probes que pasan el filtro.
     // Va antes del cooldown para que un probe descartado no bloquee a la MAC.
-    if (random(100) >= params.entradaPct) return;
+    if (random(100) >= params.entradaPct) { registrarProbeCSV(mac, rssi, ssid, "descartado_entrada"); return; }
 
     const ahora = millis();
     if (ultimosProbesPorMac.has(mac)) {
-      if (ahora - ultimosProbesPorMac.get(mac) < params.cooldownMac) return;
+      if (ahora - ultimosProbesPorMac.get(mac) < params.cooldownMac) { registrarProbeCSV(mac, rssi, ssid, "descartado_cooldown"); return; }
     }
     ultimosProbesPorMac.set(mac, ahora);
     probesAceptados++;
+    registrarProbeCSV(mac, rssi, ssid, "aceptado");
 
     if (mapEntidades.has(mac)) {
       const existente = mapEntidades.get(mac);
@@ -581,7 +690,6 @@ function procesarMensajeSerial(str) {
     }
 
     logSerialData(mac, rssi, ssid);
-    userStartAudio();
   }
 }
 
@@ -652,15 +760,17 @@ function generarProbeSimulado() {
 
 function ejecutarComandoTeclado(k) {
   if (k === "c" || k === "C") {
-    userStartAudio();
+    desbloquearAudio();
     if (!MOCK_MODE && port) {
-      if (!port.opened()) port.open(115200);
-      else port.close();
+      if (!port.opened()) { serialPausadoManual = false; port.open(115200); }
+      else { serialPausadoManual = true; port.close(); }
     }
   }
   if (k === "m" || k === "M") {
     MOCK_MODE = !MOCK_MODE;
+    reiniciarObra();               // cada modo arranca la obra de cero (no se mezclan células SIM con REAL)
     if (!MOCK_MODE) {
+      serialPausadoManual = false;
       if (!port) port = createSerial();
       const usedPorts = usedSerialPorts();
       if (usedPorts.length > 0) port.open(usedPorts[0], 115200);
@@ -673,23 +783,106 @@ function ejecutarComandoTeclado(k) {
     if (guiDiv) guiDiv.style("display", hudVisible ? "flex" : "none");
   }
   if (k === "p" || k === "P") {
-    ventanaProyector = window.open("proyector.html", "Proyector", "width=1920,height=1080");
+    window.open("proyector.html", "Proyector", "width=1920,height=1080");
   }
+  if (k === "f" || k === "F") fullscreen(!fullscreen());
+  if (k === "g" || k === "G") alternarGrabacion();
   if (k === "n" || k === "N") generarProbeSimulado();
-  if (k === "r" || k === "R") limpiarTodasLasEntidades();
+  if (k === "r" || k === "R") reiniciarObra();
 }
 
-function mousePressed() { userStartAudio(); }
+// Los navegadores solo permiten iniciar el audio tras un gesto real (clic o tecla en ESTA ventana).
+// Las teclas que llegan desde el proyector no cuentan. Para la muestra, abrir Chrome con:
+//   --autoplay-policy=no-user-gesture-required
+// Mantiene el puerto serial vivo: si se cae, reintenta solo (sin gesto, el puerto ya fue autorizado).
+function gestionarSerial(ahora) {
+  if (MOCK_MODE) { serialEstado = "sim"; return; }
+  if (!port) { try { port = createSerial(); } catch (e) {} return; }
+  let abierto = false;
+  try { abierto = port.opened(); } catch (e) {}
+  if (!abierto) {
+    ultimoDatoSerial = 0;
+    if (serialPausadoManual) { serialEstado = "pausado"; return; }
+    serialEstado = "desconectado";
+    if (ahora - ultimoIntentoSerial > SERIAL_REINTENTO_MS) {
+      ultimoIntentoSerial = ahora;
+      try {
+        const usados = usedSerialPorts();
+        if (usados.length > 0) port.open(usados[0], 115200);
+      } catch (e) { /* se reintenta en unos segundos */ }
+    }
+    return;
+  }
+  if (ultimoDatoSerial === 0) ultimoDatoSerial = ahora;
+  serialEstado = (ahora - ultimoDatoSerial > SERIAL_SILENCIO_MS) ? "sin datos" : "conectado";
+}
+
+function textoEstadoSerial() {
+  if (MOCK_MODE) return null;
+  switch (serialEstado) {
+    case "conectado": return { txt: "SERIAL: conectado", col: [80, 220, 100] };
+    case "sin datos": return { txt: `SERIAL: sin datos hace ${max(0, floor((millis() - ultimoDatoSerial) / 60000))} min`, col: [255, 160, 40] };
+    case "desconectado": return { txt: "SERIAL: desconectado · reintentando…", col: [255, 80, 80] };
+    case "pausado": return { txt: "SERIAL: pausado ([C] para reanudar)", col: [160, 160, 160] };
+    default: return null;
+  }
+}
+
+function desbloquearAudio() {
+  if (getAudioContext().state !== "running") userStartAudio();
+}
+
+function mousePressed() { desbloquearAudio(); }
 function windowResized() { resizeCanvas(windowWidth, windowHeight); }
-function keyPressed() { ejecutarComandoTeclado(key); }
+function keyPressed() {
+  desbloquearAudio();
+  ejecutarComandoTeclado(key);
+}
+
+// Segundo bit del primer byte = "administrada localmente": la MAC es aleatoria (privacidad de iOS/Android).
+function esMacAleatoria(mac) {
+  return (parseInt(mac.charAt(1), 16) & 2) !== 0;
+}
+
+function alternarGrabacion() {
+  if (!grabandoCSV) {
+    filasCSV = ["fecha_hora,ms,mac,mac_aleatoria,rssi,ssid,estado"];
+    macsVistas.clear();
+    macsAleatorias.clear();
+    inicioGrabacion = millis();
+    grabandoCSV = true;
+  } else {
+    grabandoCSV = false;
+    if (filasCSV.length > 1) {
+      const d = new Date();
+      const p2 = (n) => String(n).padStart(2, "0");
+      const sello = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+      saveStrings(filasCSV, `probes_${sello}`, "csv");
+    }
+    filasCSV = [];
+  }
+}
+
+function registrarProbeCSV(mac, rssi, ssid, estado) {
+  if (!grabandoCSV) return;
+  if (filasCSV.length > CSV_MAX_FILAS) { alternarGrabacion(); return; }   // tope: guarda y corta
+  const aleatoria = esMacAleatoria(mac);
+  macsVistas.add(mac);
+  if (aleatoria) macsAleatorias.add(mac);
+  const ssidCsv = '"' + String(ssid).replace(/"/g, '""') + '"';
+  filasCSV.push(`${new Date().toISOString()},${Math.round(millis() - inicioGrabacion)},${mac},${aleatoria ? 1 : 0},${rssi},${ssidCsv},${estado}`);
+}
 
 function logSerialData(mac, rssi, ssid) {
   if (!serialLogEl) return;
+  // Como mucho ~10 entradas por segundo: con tráfico real no se crea un elemento por cada probe.
+  const ahoraLog = millis();
+  if (ahoraLog - ultimoLog < 100) return;
+  ultimoLog = ahoraLog;
   const entry = document.createElement("div");
   entry.className = "log-entry";
   let redTexto = ssid && ssid !== "BROADCAST" ? `[${ssid}]` : `<PROBE SEARCH>`;
   entry.innerText = `${mac}  |  ${rssi} dBm  |  ${redTexto}`;
   serialLogEl.appendChild(entry);
-  const activeLogs = serialLogEl.querySelectorAll(".log-entry");
-  if (activeLogs.length > LOG_MAX) activeLogs[0].remove();
+  while (serialLogEl.children.length > LOG_MAX) serialLogEl.firstChild.remove();
 }
